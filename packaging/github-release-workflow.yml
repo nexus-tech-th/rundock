@@ -77,10 +77,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export PROCESSES_TEST_EXECUTABLE="$PWD/.build/arm64-apple-macosx/release/processes"
-          swift test --build-system native -c release
+          export PROCESSES_TEST_EXECUTABLE="$(swift build -c release --show-bin-path)/processes"
+          swift test -c release
           python3 Tests/session_reuse.py --binary "$PROCESSES_TEST_EXECUTABLE"
           python3 Tests/ai_connections.py --binary "$PROCESSES_TEST_EXECUTABLE"
+          python3 Tests/task_interfaces.py --binary "$PROCESSES_TEST_EXECUTABLE"
       - name: Verify package and create cask
         shell: bash
         run: |

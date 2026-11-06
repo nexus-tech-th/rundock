@@ -25,7 +25,7 @@ struct Arguments {
 }
 
 let help = """
-RunDock 0.4.0 — shared native dev processes for humans and AI
+RunDock 0.4.1 — shared native dev processes for humans and AI
 
   rundock run [--task ID] [--cwd DIR] [--name NAME] [--actor NAME] [--wait] [--json] [--new] -- program args...
   rundock run [--task ID] [--cwd DIR] [--name NAME] [--actor NAME] [--wait] [--json] [--new] --command SHELL_STRING
@@ -157,7 +157,7 @@ func run() throws {
     if command == "run" { try autoRun(args.values); return }
     if command == "shell" { if args.values == ["--help"] { print(help); return }; try shellCommand(args.values); return }
     if ["help", "--help", "-h"].contains(command) || args.flag("--help") { print(help); return }
-    if command == "--version" { print("0.4.0"); return }
+    if command == "--version" { print("0.4.1"); return }
     if command == "daemon" {
         let action = try args.id()
         let stopServices = args.flag("--stop-services"); try args.finish()

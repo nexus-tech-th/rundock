@@ -12,6 +12,9 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/In
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$APP/Contents/Info.plist")" = RunDock
 test "$("$APP/Contents/Helpers/rundock" --version)" = "$VERSION"
 test -f "$APP/Contents/Resources/RunDock.icns"
+# SwiftTerm shader resources are sealed inside Contents/Resources.
+SHADER_BUNDLE="$APP/Contents/Resources/SwiftTerm_SwiftTerm.bundle"
+test -f "$SHADER_BUNDLE/Shaders.metal" || test -f "$SHADER_BUNDLE/Contents/Resources/Shaders.metal"
 test -f "$APP/Contents/Resources/skills/rundock/SKILL.md"
 test -f "$APP/Contents/Resources/acknowledgments/RunDock-LICENSE"
 test -f "$APP/Contents/Resources/acknowledgments/SwiftTerm-LICENSE"

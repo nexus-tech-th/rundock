@@ -20,7 +20,7 @@ usage() {
 Usage: scripts/build-app.sh [--skip-build] [--identity IDENTITY] [--notarize] [--output ABS_APP_PATH]
 
 Builds dist/RunDock.app and its companion CLI. --skip-build uses existing
-.build/<architecture>-apple-macosx/release binaries (or .build/release).
+the active SwiftPM build output directory reported by --show-bin-path.
 Signing defaults to ad hoc. For notarization, provide
 DEVELOPER_ID_APPLICATION, NOTARY_PROFILE (a stored notarytool profile), and
 NOTARIZE=1 or pass --notarize.
@@ -41,15 +41,11 @@ while (($#)); do
 done
 
 if [[ "$SKIP_BUILD" == 0 ]]; then
-  (cd "$ROOT" && swift build --build-system native -c "$CONFIGURATION")
+  (cd "$ROOT" && swift build -c "$CONFIGURATION")
 fi
 
-ARCH="$(uname -m)"
-BIN_DIR="$ROOT/.build/$ARCH-apple-macosx/$CONFIGURATION"
-if [[ ! -d "$BIN_DIR" && -d "$ROOT/.build/$CONFIGURATION" ]]; then
-  # Compatibility with SwiftPM layouts that use a non-triple build directory.
-  BIN_DIR="$ROOT/.build/$CONFIGURATION"
-fi
+# Ask SwiftPM: modern and classic build systems use different output layouts.
+BIN_DIR="$(cd "$ROOT" && swift build -c "$CONFIGURATION" --show-bin-path)"
 
 case "$APP" in
   "$ROOT"/dist/*.app)
@@ -97,12 +93,11 @@ SwiftTerm
 Source: https://github.com/migueldeicaza/SwiftTerm
 License: MIT
 EOF
-SWIFTERM_LICENSE="$ROOT/.build/checkouts/SwiftTerm/LICENSE"
+SWIFTERM_LICENSE="$ROOT/Vendor/SwiftTerm/LICENSE"
 [[ -f "$SWIFTERM_LICENSE" ]] || { echo "SwiftTerm license missing at $SWIFTERM_LICENSE" >&2; exit 1; }
 cp "$SWIFTERM_LICENSE" "$RESOURCES/acknowledgments/SwiftTerm-LICENSE"
 
-# SwiftPM places generated resource bundles beside the executable. Preserve
-# any such bundles so package resource lookups continue to work in the app.
+# Place SwiftPM resource bundles in the signed app resources directory.
 shopt -s nullglob
 for bundle in "$BIN_DIR"/*.bundle; do
   cp -R "$bundle" "$RESOURCES/"

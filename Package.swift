@@ -3,7 +3,7 @@ import PackageDescription
 let package = Package(
     name: "Processes", platforms: [.macOS(.v13)],
     products: [.executable(name: "processes", targets: ["processes"]), .executable(name: "ProcessesApp", targets: ["ProcessesApp"])],
-    dependencies: [.package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.13.0")],
+    dependencies: [.package(path: "Vendor/SwiftTerm")],
     targets: [
         .target(name: "ProcessesProtocol"),
         .target(name: "ProcessesRuntime", dependencies: ["ProcessesProtocol"]),

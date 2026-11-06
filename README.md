@@ -4,7 +4,7 @@ Persistent native terminals and shared process control for humans and AI coding 
 
 RunDock keeps development servers and interactive project shells available across AI turns. People and AI can inspect the same output, discover listening ports, and start, stop or restart managed jobs. Common development commands reuse an existing live server in the same directory, including switches between npm, pnpm, yarn and bun.
 
-Built by [NEXUS TECHNOLOGY COMPANY LIMITED](https://nexustecs.com/). Native SwiftUI/AppKit and SwiftTerm; no web UI server.
+Built by [NEXUS TECHNOLOGY COMPANY LIMITED](https://nexustecs.com/). Native SwiftUI/AppKit and SwiftTerm; no web UI server. The vendored MIT-licensed SwiftTerm 1.13.0 has a narrowly scoped packaged-resource loader fix; see [provenance](Vendor/SwiftTerm/UPSTREAM.md).
 
 ## Install
 
@@ -84,7 +84,7 @@ Protected macOS folders may require selecting the exact project folder once thro
 ## Build and release
 
 ```sh
-swift build --build-system native -c release
+swift build -c release
 scripts/package-dmg.sh --skip-build
 ```
 
