@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIGURATION=release
 IDENTITY="${DEVELOPER_ID_APPLICATION:-}"
 NOTARIZE="${NOTARIZE:-0}"
+APP="$ROOT/dist/RunDock.app"
 RELEASE_REPOSITORY="${RUNDOCK_RELEASE_REPOSITORY:-nexus-tech-th/rundock}"
 if [[ -n "$RELEASE_REPOSITORY" && ! "$RELEASE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   echo "RUNDOCK_RELEASE_REPOSITORY must be owner/repository" >&2; exit 2
@@ -16,7 +17,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: scripts/build-app.sh [--skip-build] [--identity IDENTITY] [--notarize]
+Usage: scripts/build-app.sh [--skip-build] [--identity IDENTITY] [--notarize] [--output ABS_APP_PATH]
 
 Builds dist/RunDock.app and its companion CLI. --skip-build uses existing
 .build/<architecture>-apple-macosx/release binaries (or .build/release).
@@ -32,6 +33,7 @@ while (($#)); do
     --skip-build) SKIP_BUILD=1 ;;
     --identity) shift; IDENTITY="${1:?missing signing identity}" ;;
     --notarize) NOTARIZE=1 ;;
+    --output) shift; APP="${1:?missing output app path}" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -49,7 +51,13 @@ if [[ ! -d "$BIN_DIR" && -d "$ROOT/.build/$CONFIGURATION" ]]; then
   BIN_DIR="$ROOT/.build/$CONFIGURATION"
 fi
 
-APP="$ROOT/dist/RunDock.app"
+case "$APP" in
+  "$ROOT"/dist/*.app)
+    APP_NAME="${APP#"$ROOT/dist/"}"
+    [[ "$APP_NAME" != */* && "$APP_NAME" =~ ^[A-Za-z0-9._-]+\.app$ ]] || { echo "Output must be a direct .app child of dist" >&2; exit 2; }
+    ;;
+  *) echo "Output must be an app path inside $ROOT/dist" >&2; exit 2 ;;
+esac
 MACOS="$APP/Contents/MacOS"
 HELPERS="$APP/Contents/Helpers"
 RESOURCES="$APP/Contents/Resources"
@@ -136,7 +144,7 @@ fi
 if [[ "$NOTARIZE" == 1 ]]; then
   [[ -n "$IDENTITY" ]] || { echo "Notarization requires Developer ID signing." >&2; exit 1; }
   [[ -n "${NOTARY_PROFILE:-}" ]] || { echo "Set NOTARY_PROFILE to a stored notarytool profile." >&2; exit 1; }
-  ZIP="$ROOT/dist/Nexus-RunDock-notarize.zip"
+  ZIP="$ROOT/dist/RunDock-notarize.zip"
   ditto -c -k --keepParent "$APP" "$ZIP"
   NOTARY_ARGS=(--keychain-profile "$NOTARY_PROFILE")
   if [[ -n "${NOTARY_KEYCHAIN:-}" ]]; then NOTARY_ARGS+=(--keychain "$NOTARY_KEYCHAIN"); fi

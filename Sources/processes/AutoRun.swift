@@ -34,7 +34,7 @@ private func truncateUTF8(_ text: String, limit: Int) -> String {
 }
 
 func autoRun(_ values: [String]) throws {
-    var cwd: String?, name: String?, actor: String?, shell: String?
+    var cwd: String?, name: String?, actor: String?, shell: String?, taskID: String?
     var wait = false, json = false, forceNew = false, index = 0
     var argv: [String] = []
     while index < values.count {
@@ -44,11 +44,12 @@ func autoRun(_ values: [String]) throws {
         if value == "--new" { forceNew = true; continue }
         if value == "--json" { json = true; continue }
         if value == "--help" || value == "-h" { print(help); return }
-        guard ["--cwd", "--name", "--actor", "--command"].contains(value), index < values.count else {
+        guard ["--cwd", "--name", "--actor", "--command", "--task"].contains(value), index < values.count else {
             throw RuntimeError("Unexpected or incomplete run option: \(value)")
         }
         let next = values[index]; index += 1
         switch value {
+        case "--task": taskID = next
         case "--cwd": cwd = next
         case "--name": name = next
         case "--actor": actor = next
@@ -59,8 +60,7 @@ func autoRun(_ values: [String]) throws {
     guard !(wait && json) else { throw RuntimeError("--wait and --json cannot be combined; --wait streams output") }
     guard (shell != nil) != !argv.isEmpty else { throw RuntimeError("Provide either --command SHELL_STRING or -- program args...") }
     guard shell?.isEmpty != true, argv.first?.isEmpty != true else { throw RuntimeError("Command must not be empty") }
-    let current = FileManager.default.currentDirectoryPath
-    let path = URL(fileURLWithPath: cwd ?? current, relativeTo: URL(fileURLWithPath: current, isDirectory: true)).standardizedFileURL.resolvingSymlinksInPath().path
+    let path = try projectCommandPath(cwd: cwd, taskID: taskID)
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else { throw RuntimeError("Working directory does not exist: \(path)") }
     let root = git(["rev-parse", "--show-toplevel"], cwd: path)
@@ -77,7 +77,7 @@ func autoRun(_ values: [String]) throws {
     let selectedName = name.flatMap { $0.isEmpty ? nil : $0 } ?? truncateUTF8(readable, limit: 128)
     let service = Service(project: project, name: selectedName, command: command, cwd: path, startedBy: selectedActor, branch: branch)
     try ready()
-    let response = try client.send(Request("run", service: service, actor: selectedActor, forceNew: forceNew))
+    let response = try client.send(Request("run", service: service, actor: selectedActor, forceNew: forceNew, taskID: taskID))
     guard let selected = response.services?.first, response.services?.count == 1 else { throw RuntimeError("Daemon did not return the selected service") }
     if !wait || json {
         if !json && response.reused == true { print("Reusing existing service") }
@@ -88,9 +88,8 @@ func autoRun(_ values: [String]) throws {
 
 // A login shell remains owned by the daemon, so later clients can attach or
 // send input to the same project terminal.
-func ensureProjectShell(cwd: String?, actor: String?, name: String? = nil) throws -> Response {
-    let current = FileManager.default.currentDirectoryPath
-    let path = URL(fileURLWithPath: cwd ?? current, relativeTo: URL(fileURLWithPath: current, isDirectory: true)).standardizedFileURL.resolvingSymlinksInPath().path
+func ensureProjectShell(cwd: String?, actor: String?, name: String? = nil, taskID: String? = nil) throws -> Response {
+    let path = try projectCommandPath(cwd: cwd, taskID: taskID)
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else { throw RuntimeError("Working directory does not exist: \(path)") }
     let environment = ProcessInfo.processInfo.environment
@@ -101,17 +100,31 @@ func ensureProjectShell(cwd: String?, actor: String?, name: String? = nil) throw
     let selectedActor = actor.flatMap { $0.isEmpty ? nil : $0 } ?? environment["RUNDOCK_ACTOR"].flatMap { $0.isEmpty ? nil : $0 } ?? "AI/CLI"
     let service = Service(project: project, name: name ?? "Terminal", command: "exec \(quote(shell)) -l", cwd: path, startedBy: selectedActor, branch: branch)
     try ready()
-    return try client.send(Request("run", service: service, actor: selectedActor))
+    return try client.send(Request("run", service: service, actor: selectedActor, taskID: taskID))
 }
 
 func shellCommand(_ values: [String]) throws {
     var args = Arguments(values: values)
-    let cwd = try args.option("--cwd"), actor = try args.option("--actor")
+    let cwd = try args.option("--cwd"), actor = try args.option("--actor"), taskID = try args.option("--task")
     let json = args.flag("--json"), attach = args.flag("--attach")
     guard !(json && attach) else { throw RuntimeError("--json and --attach cannot be combined") }
     try args.finish()
-    let response = try ensureProjectShell(cwd: cwd, actor: actor)
+    let response = try ensureProjectShell(cwd: cwd, actor: actor, taskID: taskID)
     guard let selected = response.services?.first, response.services?.count == 1 else { throw RuntimeError("Daemon did not return the selected shell") }
     if attach { _ = try stream(id: selected.id, interactive: true) }
     else { if !json && response.reused == true { print("Reusing existing project shell") }; try emit(response, json: json) }
+}
+
+// Resolve the persisted task before choosing a default cwd; daemon validates the
+// final directory again before starting or reusing any bound process.
+func projectCommandPath(cwd: String?, taskID: String?) throws -> String {
+    let current = FileManager.default.currentDirectoryPath
+    var selected = cwd
+    if let taskID {
+        guard !taskID.isEmpty else { throw RuntimeError("taskID must not be empty") }
+        try ready()
+        guard let task = try client.send(Request("task-list")).tasks?.first(where: { $0.id == taskID }) else { throw RuntimeError("Unknown task ID: \(taskID)") }
+        if selected == nil { selected = task.worktreePath }
+    }
+    return URL(fileURLWithPath: selected ?? current, relativeTo: URL(fileURLWithPath: current, isDirectory: true)).standardizedFileURL.resolvingSymlinksInPath().path
 }

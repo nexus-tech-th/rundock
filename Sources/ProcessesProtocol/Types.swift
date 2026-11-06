@@ -2,6 +2,7 @@ import Foundation
 
 public struct Service: Codable, Identifiable, Equatable, Sendable {
     public var id: String
+    public var taskID: String?
     public var project: String
     public var name: String
     public var command: String
@@ -55,9 +56,18 @@ public struct Request: Codable, Sendable {
     public var rows: UInt16?
     public var actor: String?
     public var forceNew: Bool?
-    public init(_ action: String, service: Service? = nil, id: String? = nil, data: Data? = nil, offset: UInt64? = nil, columns: UInt16? = nil, rows: UInt16? = nil, actor: String? = nil, forceNew: Bool? = nil) {
+    public var taskID: String?
+    public var taskKey: String?
+    public var repositoryPath: String?
+    public var taskName: String?
+    public var clientName: String?
+    public var paths: [String]?
+    public var staged: Bool?
+    public var message: String?
+    public init(_ action: String, service: Service? = nil, id: String? = nil, data: Data? = nil, offset: UInt64? = nil, columns: UInt16? = nil, rows: UInt16? = nil, actor: String? = nil, forceNew: Bool? = nil, taskID: String? = nil, taskKey: String? = nil, repositoryPath: String? = nil, taskName: String? = nil, clientName: String? = nil, paths: [String]? = nil, staged: Bool? = nil, message: String? = nil) {
         self.action = action; self.service = service; self.id = id; self.data = data; self.offset = offset
         self.columns = columns; self.rows = rows; self.actor = actor; self.forceNew = forceNew
+        self.taskID = taskID; self.taskKey = taskKey; self.repositoryPath = repositoryPath; self.taskName = taskName; self.clientName = clientName; self.paths = paths; self.staged = staged; self.message = message
     }
 }
 
@@ -71,8 +81,13 @@ public struct Response: Codable, Sendable {
     public var protocolVersion: Int?
     public var connections: [AIConnection]?
     public var reused: Bool?
-    public init(ok: Bool = true, error: String? = nil, services: [Service]? = nil, data: Data? = nil, offset: UInt64? = nil, daemonPID: Int32? = nil, protocolVersion: Int? = nil, connections: [AIConnection]? = nil, reused: Bool? = nil) {
-        self.ok = ok; self.error = error; self.services = services; self.data = data; self.offset = offset; self.daemonPID = daemonPID; self.protocolVersion = protocolVersion; self.connections = connections; self.reused = reused
+    public var tasks: [GitTask]?
+    public var task: GitTask?
+    public var gitStatus: [GitChange]?
+    public var text: String?
+    public var truncated: Bool?
+    public init(ok: Bool = true, error: String? = nil, services: [Service]? = nil, data: Data? = nil, offset: UInt64? = nil, daemonPID: Int32? = nil, protocolVersion: Int? = nil, connections: [AIConnection]? = nil, reused: Bool? = nil, tasks: [GitTask]? = nil, task: GitTask? = nil, gitStatus: [GitChange]? = nil, text: String? = nil, truncated: Bool? = nil) {
+        self.ok = ok; self.error = error; self.services = services; self.data = data; self.offset = offset; self.daemonPID = daemonPID; self.protocolVersion = protocolVersion; self.connections = connections; self.reused = reused; self.tasks = tasks; self.task = task; self.gitStatus = gitStatus; self.text = text; self.truncated = truncated
     }
 }
 

@@ -10,7 +10,7 @@ import ProcessesProtocol
     @Published var automatic: Bool {
         didSet { UserDefaults.standard.set(automatic, forKey: "automaticUpdateChecks") }
     }
-    var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.1" }
+    var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.0" }
     var repository: String? { Bundle.main.object(forInfoDictionaryKey: "RunDockUpdateRepository") as? String }
     private var timer: Timer?
     private init() {

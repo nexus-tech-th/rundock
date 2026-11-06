@@ -7,15 +7,29 @@ description: Route project commands through RunDock so AI and the user share man
 
 When this skill is available, run project commands through the `rundock` CLI so the user and AI can inspect and control the same jobs in the RunDock app. Do not ask the user to name a project, service, actor, or session before each run. Derive the working directory from the active project/worktree, use the command being run as the job identity, and use the supplied actor name only when one is already available. The CLI reuses recognized server roles within the same working directory and falls back to exact-command matching for other commands.
 
+## Bind AI tasks to Git worktrees
+
+Before parallel coding, ensure one persistent Git worktree for each AI task. Use the actual platform conversation/task ID when the client exposes one (for example, `CODEX_THREAD_ID`). Keep that stable key when resuming the same task. If the client exposes no stable key, use an explicit caller-supplied key retained for future turns. An MCP connection/session ID identifies a connection and must not be used or described as a chat ID.
+
+- CLI: `rundock task ensure --repo ABS --task STABLE_KEY --name NAME --client CLIENT --json`.
+- MCP: `rundock_task` with `action: "ensure"`, `repositoryPath`, `taskKey`, `name`, and `client`.
+- Use the returned task's `worktreePath` for file reads and edits, and its opaque `id` as `--task ID` / MCP `taskID` for commands and Git controls. Bound runs default to that worktree root when cwd is omitted; an explicit cwd must be inside it. Never continue editing or running commands in the original checkout after binding.
+- Inspect `rundock task list --json` / `rundock_task` with `action: "list"` to recover persisted IDs and paths. Repeating ensure with the same repository and task key reuses the binding.
+- Respect a worktree the user already selected: pass that actual path to ensure; do not silently move their in-progress edits to a new directory or claim their changes were copied. Keep separate concurrent tasks isolated.
+
+RunDock cannot intercept every client's task creation or edits. This binding works when the client follows the skill or explicitly calls these tools. Do not claim that connecting MCP automatically creates a worktree for every chat.
+
+Use `rundock git status|diff --task ID` for inspection, adding `--staged` to diff when needed. Use `stage|unstage --task ID --path PATH` (repeat `--path` for more files), `commit --task ID --message TEXT`, and `push --task ID` only within the user's authorized Git scope. MCP `rundock_git` uses the same action names with `taskID`, `paths` as a JSON string array, optional `staged` for diff, and `message` for commit. Paths containing spaces remain individual array items; never construct shell commands from filenames. A task worktree does not itself authorize commits or pushes.
+
 ## Run project commands
 
 Locate `rundock` on PATH. If unavailable, use the existing helper at `/Applications/RunDock.app/Contents/Helpers/rundock` or `~/Applications/RunDock.app/Contents/Helpers/rundock`. When connected through MCP, prefer the available RunDock tools rather than requiring a separate CLI installation. Never guess a missing executable path.
 
-Use `rundock run --cwd DIR -- program args...` for a command. Use `--command SHELL_STRING` only when shell syntax such as pipes, redirects, or chaining is required.
+Use `rundock run --task ID --cwd DIR -- program args...` for a bound task, or `rundock run --cwd DIR -- program args...` for a command. Use `--command SHELL_STRING` only when shell syntax such as pipes, redirects, or chaining is required.
 
 - Keep development servers and other intentionally long-running project processes detached from the AI turn. Their managed status, output, and history remain visible in RunDock.
 - Before starting a server, inspect existing jobs for the active directory. Reuse a running development server and its discovered port; inspect its logs instead of creating a replacement at the next available port. RunDock recognizes common dev/start/preview commands in the same directory, including changes between npm/pnpm/yarn/bun. Complex shell wrappers use exact matching, so pass the real cwd and executable directly.
-- Use `rundock shell --cwd DIR --json` or MCP `rundock_shell` to create or reconnect to the project's persistent interactive shell. Send input and read output through the returned job ID. The human and AI share that PTY; do not type shell commands into a foreground dev server. Use a separate finite `run --wait` job when an exit code is needed.
+- Use `rundock shell --task ID --cwd DIR --json` (omit `--task` for an unbound project) or MCP `rundock_shell` with `taskID` when bound to create or reconnect to the project's persistent interactive shell. Send input and read output through the returned job ID. The human and AI share that PTY; do not type shell commands into a foreground dev server. Use a separate finite `run --wait` job when an exit code is needed.
 - Use `run --new` / MCP `forceNew: true` only when the user explicitly requests a parallel instance. A new task, code edit, or model turn is not a reason to duplicate a live server or stop it.
 - Use `--wait` for short builds, tests, linters, and other finite commands. Read its exit status and report failures accurately.
 - Use `--json` when structured output is useful.

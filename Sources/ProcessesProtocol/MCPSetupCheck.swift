@@ -50,7 +50,7 @@ public extension AIConnectors {
             throw RuntimeError("RunDock MCP tool list response was invalid")
         }
         let toolNames = tools.compactMap { $0["name"] as? String }.sorted()
-        let required = ["rundock_run", "rundock_shell", "rundock_list", "rundock_start", "rundock_stop", "rundock_restart", "rundock_logs", "rundock_input"]
+        let required = ["rundock_run", "rundock_shell", "rundock_list", "rundock_start", "rundock_stop", "rundock_restart", "rundock_logs", "rundock_input", "rundock_task", "rundock_git"]
         let missing = required.filter { !toolNames.contains($0) }
         guard missing.isEmpty else {
             throw RuntimeError("RunDock MCP helper is missing required tools: \(missing.joined(separator: ", "))")

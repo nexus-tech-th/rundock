@@ -27,7 +27,7 @@ final class MCPSetupCheckTests: XCTestCase {
     }
 
     func testVerifiesInitializedRunDockAndRequiredTools() throws {
-        let required = ["rundock_run", "rundock_shell", "rundock_list", "rundock_start", "rundock_stop", "rundock_restart", "rundock_logs", "rundock_input"]
+        let required = ["rundock_run", "rundock_shell", "rundock_list", "rundock_start", "rundock_stop", "rundock_restart", "rundock_logs", "rundock_input", "rundock_task", "rundock_git"]
         let (root, helper) = try helper(body: handshakeScript(tools: required))
         defer { try? fileManager.removeItem(at: root) }
 
@@ -39,7 +39,9 @@ final class MCPSetupCheckTests: XCTestCase {
     func testActualRunDockHelper() throws {
         guard let path = ProcessInfo.processInfo.environment["PROCESSES_TEST_EXECUTABLE"] else { throw XCTSkip("Set PROCESSES_TEST_EXECUTABLE for actual helper verification") }
         let result = try AIConnectors.verifyMCP(executableURL: URL(fileURLWithPath: path))
-        XCTAssertEqual(result.toolNames.count, 8)
+        XCTAssertEqual(result.toolNames.count, 10)
+        XCTAssertTrue(result.toolNames.contains("rundock_task"))
+        XCTAssertTrue(result.toolNames.contains("rundock_git"))
     }
 
     func testRejectsHelperMissingRequiredTool() throws {

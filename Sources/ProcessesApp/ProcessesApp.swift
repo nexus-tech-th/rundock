@@ -38,9 +38,11 @@ extension Service {
     @Published var showingSSH = false
     @Published var showingAppearance = false
     @Published var showingUpdates = false
+    @Published var showingGit = false
     @Published var tabs: [TerminalTab] = []
     @Published var activeTabID: UUID?
     @Published var focusedPaneID: UUID?
+    @Published var terminalRenderers: [UUID: String] = [:]
     weak var terminal: TerminalView?
     private let queue = DispatchQueue(label: "Processes.client", qos: .userInitiated)
     private let client = RuntimeClient()
@@ -67,6 +69,7 @@ extension Service {
         return URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("processes")
     }
     func select(_ id: String?) {
+        showingGit = false
         guard let id else { selectedID = nil; terminal = nil; return }
         if let index = tabs.firstIndex(where: { $0.panes.contains(where: { $0.serviceID == id }) }) {
             activeTabID = tabs[index].id
@@ -85,7 +88,7 @@ extension Service {
         queue.async { [client] in
             let result = Result { () -> Response in
                 let ping = try client.send(Request("ping"))
-                guard (ping.protocolVersion ?? 1) >= 3 else { throw RuntimeError("Restart the older daemon after stopping its services to enable live AI connection status.") }
+                guard (ping.protocolVersion ?? 1) >= 5 else { throw RuntimeError("Stop the older daemon’s services, then restart it to enable streaming and task workspaces. Running jobs are preserved until you stop them.") }
                 var list = try client.send(Request("list")); list.daemonPID = ping.daemonPID
                 list.connections = try client.send(Request("ai-connections")).connections
                 return list
@@ -95,13 +98,18 @@ extension Service {
                 switch result {
                 case .failure(let error): self.daemonPID = nil; self.connectionError = error.localizedDescription; self.aiConnections = []
                 case .success(let list):
-                    self.services = list.services ?? []; self.daemonPID = list.daemonPID; self.connectionError = nil
-                    self.aiConnections = list.connections ?? []
+                    let services = list.services ?? []
+                    if self.services != services { self.services = services }
+                    if self.daemonPID != list.daemonPID { self.daemonPID = list.daemonPID }
+                    if self.connectionError != nil { self.connectionError = nil }
+                    let connections = list.connections ?? []
+                    if self.aiConnections != connections { self.aiConnections = connections }
                     if !self.restoredLayout { self.restoreLayout() }
                     let ids = Set(self.services.map(\.id))
-                    self.tabs = self.tabs.compactMap { tab in
+                    let validTabs = self.tabs.compactMap { tab -> TerminalTab? in
                         var value = tab; value.panes.removeAll { !ids.contains($0.serviceID) }; return value.panes.isEmpty ? nil : value
                     }
+                    if self.tabs != validTabs { self.tabs = validTabs }
                     if let selected = self.selectedID, !ids.contains(selected) { self.selectedID = nil }
                     if self.selectedID == nil, !self.userClosedAllTabs, let newest = self.services.max(by: { ($0.startedAt ?? .distantPast) < ($1.startedAt ?? .distantPast) }) { self.select(newest.id) }
                 }
@@ -138,6 +146,7 @@ extension Service {
         if tabs[i].panes.isEmpty { closeTab(tabID) } else { activateTab(tabs[i]); saveLayout() }
     }
     func newTerminal(split: Bool = false, horizontal: Bool = true, command: String? = nil, name: String? = nil) {
+        let taskID = name == nil ? selected?.taskID : nil
         let cwd = (name == nil ? selected?.cwd : nil) ?? FileManager.default.homeDirectoryForCurrentUser.path
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         let command = command ?? "exec '" + shell.replacingOccurrences(of: "'", with: "'\\''") + "' -l"
@@ -147,7 +156,7 @@ extension Service {
             sessionName = "\(baseName) \(number)"; number += 1
         }
         let service = Service(project: name == nil ? "Terminals" : "SSH", name: sessionName, command: command, cwd: cwd)
-        send(Request("add", service: service, actor: "User")) { added in
+        send(Request("add", service: service, actor: "User", taskID: taskID)) { added in
             guard added else { return }
             self.send(Request("start", id: service.id, actor: "User")) { started in
                 guard started else { return }
@@ -155,6 +164,25 @@ extension Service {
                 if split, let i = self.tabs.firstIndex(where: { $0.id == self.activeTabID }), self.tabs[i].panes.count < 4 {
                     let pane = TerminalPane(serviceID: service.id); self.tabs[i].panes.append(pane); self.tabs[i].horizontal = horizontal; self.focusedPaneID = pane.id; self.selectedID = service.id; self.saveLayout()
                 } else { self.select(service.id) }
+            }
+        }
+    }
+    func openTaskTerminal(_ task: GitTask) {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let command = "exec '" + shell.replacingOccurrences(of: "'", with: "'\\''") + "' -l"
+        let service = Service(project: task.name, name: "Task Shell", command: command, cwd: task.worktreePath, branch: task.branch)
+        queue.async { [client] in
+            let result = Result { try client.send(Request("run", service: service, actor: "User", taskID: task.id)) }
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let response):
+                    if let service = response.services?.first {
+                        if let i = self.services.firstIndex(where: { $0.id == service.id }) { self.services[i] = service }
+                        else { self.services.append(service) }
+                        self.userClosedAllTabs = false; self.select(service.id); self.poll()
+                    }
+                case .failure(let error): self.error = error.localizedDescription
+                }
             }
         }
     }
@@ -224,6 +252,7 @@ extension Service {
             CommandGroup(after: .newItem) {
                 Button("Add Service…") { model.showingAdd = true }.keyboardShortcut("n", modifiers: [.command, .shift])
                 Button("Connect AI…") { model.showingConnections = true }
+                Button("AI Tasks & Git") { model.showingGit = true }
                 Button("New Terminal Tab") { model.newTerminal() }.keyboardShortcut("t", modifiers: .command)
                 Button("Split Vertically") { model.newTerminal(split: true) }.keyboardShortcut("d", modifiers: .command)
                 Button("Split Horizontally") { model.newTerminal(split: true, horizontal: false) }.keyboardShortcut("d", modifiers: [.command, .shift])
@@ -246,8 +275,12 @@ struct RootView: View {
                 HStack(spacing: 0) {
                     Sidebar().frame(width: 225)
                     Rectangle().fill(Palette.line).frame(width: 1)
-                    MainPane().frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if geometry.size.width >= 1100 {
+                    if model.showingGit {
+                        GitWorkspaceView().frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        MainPane().frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                    if !model.showingGit && geometry.size.width >= 1100 {
                         Rectangle().fill(Palette.line).frame(width: 1)
                         Inspector().frame(width: 260)
                     }
@@ -319,6 +352,8 @@ struct Sidebar: View {
                 }
             }
             Spacer(minLength: 0)
+            Button { model.showingGit = true } label: { Label("AI Tasks & Git", systemImage: "arrow.triangle.branch").frame(maxWidth: .infinity, alignment: .leading) }
+                .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(model.showingGit ? Palette.mint : .primary).padding(.horizontal, 17).padding(.vertical, 10)
             Button { model.newTerminal() } label: { Label("New Terminal", systemImage: "terminal").frame(maxWidth: .infinity, alignment: .leading) }
                 .buttonStyle(.plain).font(.system(size: 12)).padding(.horizontal, 17).padding(.vertical, 10)
             Button { model.showingSSH = true } label: { Label("SSH Hosts & SFTP", systemImage: "network").frame(maxWidth: .infinity, alignment: .leading) }
@@ -350,6 +385,9 @@ struct MainPane: View {
                 if let service = model.selected { Text(service.project).font(.system(size: 11)).foregroundStyle(Palette.muted) }
                 Spacer()
                 if let service = model.selected {
+                    if service.taskID != nil {
+                        Button { model.showingGit = true } label: { Label("Git", systemImage: "arrow.triangle.branch") }
+                    }
                     if let port = service.visiblePorts.first {
                         Button { if let url = URL(string: "http://localhost:\(port)") { NSWorkspace.shared.open(url) } } label: { Label("Open", systemImage: "arrow.up.right") }
                             .help("Open localhost:\(port)")
@@ -506,7 +544,7 @@ struct AddServiceView: View {
 
 struct AboutView: View {
     @Environment(\.dismiss) private var dismiss
-    private var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.1" }
+    private var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.0" }
     var body: some View {
         VStack(spacing: 10) {
             Image(nsImage: NSImage(named: NSImage.applicationIconName) ?? NSImage())

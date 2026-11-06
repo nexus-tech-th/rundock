@@ -56,6 +56,11 @@ struct TerminalWorkspaceView: View {
                 Text(model.services.first { $0.id == pane.serviceID }?.name ?? "Terminal").lineLimit(1)
                 Spacer(minLength: 4)
                 Text(model.services.first { $0.id == pane.serviceID }?.status.capitalized ?? "").foregroundStyle(Palette.muted)
+                if let renderer = model.terminalRenderers[pane.id] {
+                    Text(renderer == "Metal" ? "Metal" : "Metal unavailable")
+                        .foregroundStyle(renderer == "Metal" ? Palette.muted : .orange)
+                        .help(renderer)
+                }
                 if tab.panes.count > 1 {
                     Button { model.closePane(pane, tabID: tab.id) } label: { Image(systemName: "xmark").font(.system(size: 9)) }.buttonStyle(.plain).help("Close pane; process keeps running")
                 }
@@ -69,13 +74,32 @@ struct TerminalWorkspaceView: View {
     }
 }
 
+final class AcceleratedTerminalView: TerminalView {
+    var rendererChanged: ((String) -> Void)?
+    private var attemptedMetal = false
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil, !attemptedMetal else { return }
+        attemptedMetal = true
+        do {
+            try setUseMetal(true)
+            rendererChanged?("Metal")
+        } catch {
+            rendererChanged?("Metal unavailable: \(error.localizedDescription)")
+        }
+    }
+}
+
 struct ManagedTerminalHost: NSViewRepresentable {
     @ObservedObject var model: AppModel
     @ObservedObject private var appearance = TerminalAppearance.shared
     let pane: TerminalPane
     func makeCoordinator() -> Coordinator { Coordinator(model: model, pane: pane) }
     func makeNSView(context: Context) -> TerminalView {
-        let view = TerminalView(frame: .zero, font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular))
+        let view = AcceleratedTerminalView(frame: .zero, font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular))
+        view.rendererChanged = { [weak model] status in
+            Task { @MainActor in model?.terminalRenderers[pane.id] = status }
+        }
         view.terminalDelegate = context.coordinator
         appearance.apply(to: view)
         context.coordinator.appearanceRevision = appearance.revision
@@ -87,7 +111,7 @@ struct ManagedTerminalHost: NSViewRepresentable {
             appearance.apply(to: view); context.coordinator.appearanceRevision = appearance.revision
         }
         let running = model.services.first { $0.id == pane.serviceID }?.status == "running"
-        if running && !context.coordinator.wasRunning { context.coordinator.resize(view) }
+        if running && !context.coordinator.wasRunning { context.coordinator.resize(view); context.coordinator.resumeIfNeeded() }
         context.coordinator.wasRunning = running
         if model.focusedPaneID == pane.id {
             DispatchQueue.main.async { [weak view, weak model] in
@@ -98,15 +122,20 @@ struct ManagedTerminalHost: NSViewRepresentable {
     }
     static func dismantleNSView(_ view: TerminalView, coordinator: Coordinator) { coordinator.end() }
 
-    final class Coordinator: NSObject, TerminalViewDelegate {
+    // Coordinator state is accessed on the main thread; callbacks hand off before touching it.
+    final class Coordinator: NSObject, TerminalViewDelegate, @unchecked Sendable {
         let model: AppModel
         let pane: TerminalPane
         private let client = RuntimeClient()
         private let queue = DispatchQueue(label: "RunDock.pane", qos: .userInitiated)
-        private var timer: Timer?
+        private var stream: OutputStreamHandle?
+        private var streamEnded = false
+        private var streamGeneration = UUID()
+        private var reconnectScheduled = false
+        private var retryDelay = 0.25
+        private var reportedStreamError = false
         private var offset: UInt64 = 0
-        private var reading = false
-        private var active = true
+                private var active = true
         private var mouseMonitor: Any?
         weak var view: TerminalView?
         var appearanceRevision: UUID?
@@ -120,29 +149,66 @@ struct ManagedTerminalHost: NSViewRepresentable {
                 }
                 return event
             }
-            timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.read() }
-            read()
+            startStream()
         }
         func end() {
-            active = false; timer?.invalidate(); timer = nil; view = nil
+            active = false; stream?.cancel(); stream = nil; view = nil
             if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }; mouseMonitor = nil
         }
-        private func read() {
-            guard active, !reading else { return }; reading = true
-            let position = offset, id = pane.serviceID
-            queue.async { [weak self, client] in
-                let result = try? client.send(Request("read", id: id, offset: position))
-                DispatchQueue.main.async {
-                    guard let self else { return }; self.reading = false
-                    guard self.active, let view = self.view, let result, result.ok else { return }
-                    if let data = result.data, !data.isEmpty { view.feed(byteArray: ArraySlice(data)) }
-                    self.offset = result.offset ?? position
+        func resumeIfNeeded() {
+            if streamEnded && !reconnectScheduled { startStream() }
+        }
+        private func startStream() {
+            guard active else { return }
+            stream?.cancel()
+            streamEnded = false
+            let generation = UUID(); streamGeneration = generation
+            stream = client.streamOutput(id: pane.serviceID, offset: offset) { [weak self] event in
+                // Synchronous handoff bounds queued output while the main thread parses/renders.
+                DispatchQueue.main.sync {
+                    guard let self, self.active, self.streamGeneration == generation, let view = self.view else { return }
+                    switch event {
+                    case .success(let response):
+                        if let data = response.data, !data.isEmpty {
+                            if let end = response.offset, end >= UInt64(data.count), end - UInt64(data.count) > self.offset {
+                                view.feed(text: "\r\n[Older output is no longer retained.]\r\n")
+                            }
+                            view.feed(byteArray: ArraySlice(data))
+                            self.retryDelay = 0.25; self.reportedStreamError = false
+                        }
+                        self.offset = response.offset ?? self.offset
+                        if response.data?.isEmpty != false {
+                            self.streamEnded = true; self.scheduleReconnect()
+                        }
+                    case .failure(let error):
+                        self.streamEnded = true
+                        if !self.reportedStreamError {
+                            self.model.error = "Terminal stream: \(error.localizedDescription)"
+                            self.reportedStreamError = true
+                        }
+                        self.scheduleReconnect()
+                    }
                 }
             }
         }
+        private func scheduleReconnect() {
+            guard active, !reconnectScheduled else { return }
+            reconnectScheduled = true
+            let generation = streamGeneration
+            DispatchQueue.main.asyncAfter(deadline: .now() + retryDelay) { [weak self] in
+                guard let self, self.active, self.streamGeneration == generation else { return }
+                self.reconnectScheduled = false
+                guard self.streamEnded, self.model.services.first(where: { $0.id == self.pane.serviceID })?.status == "running" else { return }
+                self.retryDelay = min(self.retryDelay * 2, 2)
+                self.startStream()
+            }
+        }
         func send(source: TerminalView, data: ArraySlice<UInt8>) {
-            let id = pane.serviceID, bytes = Data(data)
-            Task { @MainActor in model.send(Request("input", id: id, data: bytes)) }
+            let request = Request("input", id: pane.serviceID, data: Data(data))
+            queue.async { [weak self, client] in
+                do { _ = try client.send(request) }
+                catch { DispatchQueue.main.async { self?.model.error = error.localizedDescription } }
+            }
         }
         func resize(_ source: TerminalView) { let dims = source.getTerminal().getDims(); sizeChanged(source: source, newCols: dims.cols, newRows: dims.rows) }
         func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {

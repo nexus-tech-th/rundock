@@ -48,9 +48,28 @@ rundock stop JOB_ID
 
 `rundock_shell` in MCP and `rundock shell` reconnect to the same project PTY. People and AI can send input and inspect output through that job ID. Keep a foreground server separate from a shell receiving new commands.
 
-Closing a pane/window or quitting the app keeps managed processes running. **Stop All and Quit** explicitly stops them. A daemon crash/reboot does not adopt or automatically relaunch processes.
+Closing a pane/window or quitting the app keeps managed processes running. **Stop All and Quit** explicitly stops them. A daemon crash/reboot does not adopt or automatically relaunch processes. Protocol upgrades preserve running jobs and require stopping/restarting the older daemon before using the new streaming/task features.
+
+## AI task worktrees and Git
+
+Open **AI Tasks & Git** to create a task from a local Git repository. Each task gets a branch and a separate worktree. Select files to inspect working-tree or staged diffs, stage/unstage, commit staged changes, or push the task branch. **Terminal** opens or reuses the task’s managed shell. No force push or source-checkout reset is performed.
+
+```sh
+rundock task ensure --repo /absolute/repository --task STABLE_TASK_KEY --name "Fix search" --client Codex --json
+rundock task list --json
+rundock shell --task RETURNED_TASK_ID --json
+rundock run --task RETURNED_TASK_ID -- npm run dev
+rundock git status --task RETURNED_TASK_ID --json
+rundock git diff --task RETURNED_TASK_ID --path src/search.swift
+```
+
+AI clients use `rundock_task` and `rundock_git`. Reuse the same platform conversation/task key when resuming; RunDock returns the same workspace even when called from that worktree. Edit files in its returned path and pass the returned opaque task ID to run/shell/Git tools. An MCP connection ID is not a conversation ID. Clients without a stable task identifier must supply a stable key; RunDock cannot discover arbitrary chats or intercept editing outside its tools. Respect a worktree the user already selected rather than silently moving their task.
+
+Task metadata lives alongside RunDock state; the worktrees share their repository’s Git objects. Worktree removal and branch merging remain ordinary Git operations. Push uses existing Git credentials without an interactive password prompt; configure credentials in the task terminal if needed. A timed-out Git operation requires checking repository/remote state before retrying.
 
 ## Native terminal and SSH
+
+Visible terminals receive ordered output over a persistent Unix-socket stream, with bounded backpressure and reconnect offsets. Keyboard input has its own ordered queue. The native terminal enables SwiftTerm’s Metal renderer and reports the actual renderer in each pane. If Metal initialization fails, the pane shows the failure rather than claiming GPU acceleration. This is not iTerm engine parity.
 
 ⌘T opens a tab, ⌘D splits vertically, ⇧⌘D splits horizontally. Layout restores on reopen. **Terminal Appearance** follows an iTerm2 profile’s colors/font and reloads on activation; exported `.itermcolors` import is also available. Shell prompt themes come from shell configuration. iTerm keyboard mappings, transparency and full engine parity are not imported.
 

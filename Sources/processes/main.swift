@@ -25,11 +25,17 @@ struct Arguments {
 }
 
 let help = """
-RunDock 0.3.1 — shared native dev processes for humans and AI
+RunDock 0.4.0 — shared native dev processes for humans and AI
 
-  rundock run [--cwd DIR] [--name NAME] [--actor NAME] [--wait] [--json] [--new] -- program args...
-  rundock run [--cwd DIR] [--name NAME] [--actor NAME] [--wait] [--json] [--new] --command SHELL_STRING
-  rundock shell [--cwd DIR] [--actor NAME] [--json | --attach]
+  rundock run [--task ID] [--cwd DIR] [--name NAME] [--actor NAME] [--wait] [--json] [--new] -- program args...
+  rundock run [--task ID] [--cwd DIR] [--name NAME] [--actor NAME] [--wait] [--json] [--new] --command SHELL_STRING
+  rundock shell [--task ID] [--cwd DIR] [--actor NAME] [--json | --attach]
+  rundock task ensure --repo ABS --task STABLE_KEY --name NAME --client NAME [--json]
+  rundock task list [--json]
+  rundock git status|push --task ID [--json]
+  rundock git diff --task ID --path PATH [--staged] [--json]
+  rundock git stage|unstage --task ID --path PATH [--path PATH ...] [--json]
+  rundock git commit --task ID --message TEXT [--json]
   rundock mcp                    MCP server over stdio
   rundock list [--json]
   rundock add --project NAME --name NAME --cwd ABS --command COMMAND
@@ -57,6 +63,24 @@ func emit(_ response: Response, json: Bool = false) throws {
     if json {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; encoder.dateEncodingStrategy = .iso8601
         print(String(decoding: try encoder.encode(response), as: UTF8.self)); return
+    }
+    if let task = response.task {
+        print("\(task.id)  \(task.name)  \(task.branch)\n\(task.worktreePath)"); return
+    }
+    if let tasks = response.tasks {
+        if tasks.isEmpty { print("No task worktrees.") }
+        for task in tasks { print("\(task.id)  \(task.name)  \(task.branch)\n\(task.worktreePath)") }
+        return
+    }
+    if let changes = response.gitStatus {
+        if changes.isEmpty { print("Working tree clean") }
+        for change in changes { print("\(change.indexStatus)\(change.worktreeStatus) \(change.path.debugDescription)") }
+        return
+    }
+    if let text = response.text {
+        print(text, terminator: text.hasSuffix("\n") ? "" : "\n")
+        if response.truncated == true { print("[Output truncated]") }
+        return
     }
     guard let services = response.services else { print("OK"); return }
     if services.isEmpty { print("No services. Add one with `rundock add --help` (see `rundock help`)."); return }
@@ -133,7 +157,7 @@ func run() throws {
     if command == "run" { try autoRun(args.values); return }
     if command == "shell" { if args.values == ["--help"] { print(help); return }; try shellCommand(args.values); return }
     if ["help", "--help", "-h"].contains(command) || args.flag("--help") { print(help); return }
-    if command == "--version" { print("0.3.1"); return }
+    if command == "--version" { print("0.4.0"); return }
     if command == "daemon" {
         let action = try args.id()
         let stopServices = args.flag("--stop-services"); try args.finish()
@@ -161,6 +185,34 @@ func run() throws {
     }
     let json = args.flag("--json")
     switch command {
+    case "task":
+        let action = try args.id()
+        var request: Request
+        switch action {
+        case "list": request = Request("task-list")
+        case "ensure":
+            let repository = try args.required("--repo"), key = try args.required("--task")
+            guard repository.hasPrefix("/") else { throw RuntimeError("--repo must be an absolute Git directory") }
+            request = Request("task-ensure", taskKey: key, repositoryPath: repository, taskName: try args.required("--name"), clientName: try args.required("--client"))
+        default: throw RuntimeError("Use `rundock task ensure|list`; see `rundock help`")
+        }
+        try args.finish(); try ready(); try emit(client.send(request), json: json)
+    case "git":
+        let action = try args.id()
+        guard ["status", "diff", "stage", "unstage", "commit", "push"].contains(action) else { throw RuntimeError("Unknown Git action: \(action)") }
+        let taskID = try args.required("--task")
+        var request = Request("git-\(action)", taskID: taskID)
+        if action == "diff" { request.staged = args.flag("--staged") }
+        if ["diff", "stage", "unstage"].contains(action) {
+            var paths: [String] = []
+            while let path = try args.option("--path") {
+                guard !path.isEmpty else { throw RuntimeError("--path must not be empty") }; paths.append(path)
+            }
+            if ["stage", "unstage"].contains(action), paths.isEmpty { throw RuntimeError("\(action) requires --path PATH (repeat for multiple paths)") }
+            if !paths.isEmpty { request.paths = paths }
+        }
+        if action == "commit" { request.message = try args.required("--message") }
+        try args.finish(); try ready(); try emit(client.send(request), json: json)
     case "list": try args.finish(); try ready(); try emit(client.send(Request("list")), json: json)
     case "add":
         let project = try args.required("--project"), name = try args.required("--name"), cwd = try args.required("--cwd"), value = try args.required("--command")

@@ -29,12 +29,22 @@ private struct Failure: Error, LocalizedError {
 
 private final class Supervisor: @unchecked Sendable {
     private let lock = NSRecursiveLock()
+    private let controlLock = NSLock()
+    private let gitWorkspace = GitWorkspace()
     private var services: [Service] = []
     private var aiConnections: [String: AIConnection] = [:]
     private var children: [String: (pid: pid_t, fd: Int32)] = [:]
     private var stopping: Set<String> = []
     private let root = ProcessesPaths.root
     private var stopped = false
+    private var collectors: [String: Int] = [:]
+    private let connections = DispatchSemaphore(value: 64)
+    private let streams = DispatchSemaphore(value: 48)
+    private let outputChanged = NSCondition()
+    private var outputGeneration: UInt64 = 0
+    private func notifyOutput() {
+        outputChanged.lock(); outputGeneration &+= 1; outputChanged.broadcast(); outputChanged.unlock()
+    }
     private let maxLog = 8 * 1024 * 1024
     private var logBases: [String: UInt64] = [:]
     private var stateURL: URL { root.appendingPathComponent("services.json") }
@@ -63,6 +73,7 @@ private final class Supervisor: @unchecked Sendable {
             }
         }
         let size = lseek(fd, 0, SEEK_END); close(fd)
+        notifyOutput()
         guard size > maxLog + 262_144 + 8, let all = try? Data(contentsOf: url), all.count > maxLog + 8 else { return }
         let removed = all.count - 8 - maxLog, newBase = base(id) + UInt64(removed)
         var header = newBase.littleEndian
@@ -105,41 +116,109 @@ private final class Supervisor: @unchecked Sendable {
         let result = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(server, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
         guard result == 0 else { throw sys("bind") }
         guard chmod(ProcessesPaths.socket, 0o600) == 0, listen(server, 16) == 0 else { throw sys("listen") }
-        while !stopped {
+        while true {
+            lock.lock(); let done = stopped; lock.unlock()
+            if done { break }
+            var listener = pollfd(fd: server, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&listener, 1, 250)
+            if ready == 0 || (ready < 0 && errno == EINTR) { continue }
+            if ready < 0 { throw sys("poll listener") }
             let client = accept(server, nil, nil)
-            if client < 0 { if errno == EINTR { continue }; throw sys("accept") }
+            if client < 0 {
+                if errno == EINTR { continue }
+                lock.lock(); let done = stopped; lock.unlock()
+                if done { break }; throw sys("accept")
+            }
             _ = fcntl(client, F_SETFD, FD_CLOEXEC)
             var uid: uid_t = 0, gid: gid_t = 0
-            if getpeereid(client, &uid, &gid) == 0 && uid == getuid() { handle(client) }
-            close(client)
+            guard getpeereid(client, &uid, &gid) == 0, uid == getuid(), connections.wait(timeout: .now()) == .success else { close(client); continue }
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                defer { close(client); connections.signal() }
+                handle(client)
+            }
+        }
+    }
+    private func writeResponse(_ response: Response, to fd: Int32) -> Bool {
+        guard var output = try? JSONEncoder().encode(response), output.count <= 2_000_000 else { return false }
+        output.append(10)
+        return output.withUnsafeBytes { bytes in
+            var sent = 0
+            while sent < bytes.count {
+                let n = Darwin.write(fd, bytes.baseAddress!.advanced(by: sent), bytes.count - sent)
+                if n < 0 && errno == EINTR { continue }; if n <= 0 { return false }; sent += n
+            }
+            return true
         }
     }
     private func handle(_ fd: Int32) {
         var timeout = timeval(tv_sec: 2, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        var data = Data(); var byte: UInt8 = 0
+        var data = Data(); var buffer = [UInt8](repeating: 0, count: 16384); var complete = false
         while data.count <= 1_048_576 {
-            let n = Darwin.read(fd, &byte, 1)
-            if n == 0 { break }; if n < 0 { if errno == EINTR { continue }; break }
-            if byte == 10 { break }; data.append(byte)
+            let n = Darwin.read(fd, &buffer, min(buffer.count, 1_048_577 - data.count))
+            if n < 0 && errno == EINTR { continue }; if n <= 0 { break }
+            if let end = buffer[..<n].firstIndex(of: 10) { data.append(contentsOf: buffer[..<end]); complete = true; break }
+            data.append(contentsOf: buffer[..<n])
         }
-        let response: Response
         do {
-            guard data.count <= 1_048_576 else { throw fail("Request too large") }
-            let request = try JSONDecoder().decode(Request.self, from: data)
-            lock.lock(); defer { lock.unlock() }
-            response = try process(request)
-        } catch { response = Response(ok: false, error: error.localizedDescription) }
-        if var output = try? JSONEncoder().encode(response) {
-            output.append(10)
-            output.withUnsafeBytes { bytes in
-                var sent = 0
-                while sent < bytes.count {
-                    let n = Darwin.write(fd, bytes.baseAddress!.advanced(by: sent), bytes.count - sent)
-                    if n < 0 && errno == EINTR { continue }; if n <= 0 { break }; sent += n
-                }
+            guard complete, data.count <= 1_048_576 else { throw fail("Invalid or oversized request") }
+            var request = try JSONDecoder().decode(Request.self, from: data)
+            if request.action == "stream" {
+                guard streams.wait(timeout: .now()) == .success else { throw fail("Output stream limit reached") }
+                defer { streams.signal() }
+                try stream(request, fd: fd); return
             }
+            if request.action.hasPrefix("git-") || request.action == "task-list" || request.action == "task-ensure" {
+                _ = writeResponse(try gitWorkspace.handle(request), to: fd); return
+            }
+            if ["run", "add"].contains(request.action), var service = request.service {
+                if let taskID = request.taskID {
+                    service.cwd = try gitWorkspace.resolve(taskID, cwd: service.cwd)
+                    service.taskID = taskID
+                } else { service.taskID = nil }
+                request.service = service
+            }
+            controlLock.lock(); defer { controlLock.unlock() }
+            if ["start", "restart"].contains(request.action) {
+                lock.lock(); let service = services.first(where: { $0.id == request.id }); lock.unlock()
+                if let service, let taskID = service.taskID { _ = try gitWorkspace.resolve(taskID, cwd: service.cwd) }
+            }
+            lock.lock()
+            let response: Response
+            do { response = try process(request); lock.unlock() }
+            catch { lock.unlock(); throw error }
+            _ = writeResponse(response, to: fd)
+            if request.action == "shutdown" { lock.lock(); stopped = true; lock.unlock() }
+        } catch { _ = writeResponse(Response(ok: false, error: error.localizedDescription), to: fd) }
+    }
+    private func stream(_ request: Request, fd: Int32) throws {
+        var offset = request.offset ?? 0
+        while true {
+            outputChanged.lock(); let generation = outputGeneration; outputChanged.unlock()
+            lock.lock()
+            let response: Response
+            let active: Bool
+            do {
+                let i = try index(request)
+                let id = services[i].id
+                response = try process(Request("read", id: id, offset: offset))
+                active = children[id] != nil || (collectors[id] ?? 0) > 0
+                lock.unlock()
+            } catch { lock.unlock(); throw error }
+            offset = response.offset ?? offset
+            if !(response.data ?? Data()).isEmpty {
+                guard writeResponse(response, to: fd) else { return }
+                continue
+            }
+            if !active { _ = writeResponse(response, to: fd); return }
+            var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let result = poll(&descriptor, 1, 0)
+            if result > 0 { return }
+            if result < 0 && errno != EINTR { return }
+            outputChanged.lock()
+            if generation == outputGeneration { _ = outputChanged.wait(until: Date(timeIntervalSinceNow: 1)) }
+            outputChanged.unlock()
         }
     }
     private func index(_ req: Request) throws -> Int {
@@ -147,9 +226,10 @@ private final class Supervisor: @unchecked Sendable {
         return i
     }
     private func process(_ req: Request) throws -> Response {
+        guard !stopped else { throw fail("Daemon is shutting down") }
         if let actor = req.actor, actor.utf8.count > 128 { throw fail("Actor too long") }
         switch req.action {
-        case "ping": return Response(daemonPID: getpid(), protocolVersion: 3)
+        case "ping": return Response(daemonPID: getpid(), protocolVersion: 5)
         case "ai-connections":
             let now = Date()
             aiConnections = aiConnections.filter { now.timeIntervalSince($0.value.disconnectedAt ?? $0.value.lastSeen) < 86400 }
@@ -190,7 +270,7 @@ private final class Supervisor: @unchecked Sendable {
                 func sameDirectory(_ existing: Service) -> Bool {
                     URL(fileURLWithPath: existing.cwd).resolvingSymlinksInPath().standardizedFileURL.path == s.cwd
                 }
-                func matching(_ service: Service) -> Bool { sameDirectory(service) && (service.command == s.command || (role != nil && ServiceIdentity.reuseKey(command: service.command) == role)) }
+                func matching(_ service: Service) -> Bool { service.taskID == s.taskID && sameDirectory(service) && (service.command == s.command || (role != nil && ServiceIdentity.reuseKey(command: service.command) == role)) }
                 let exactLive = services.firstIndex { matching($0) && $0.command == s.command && children[$0.id] != nil }
                 let live = services.firstIndex { matching($0) && children[$0.id] != nil }
                 let exact = services.firstIndex { matching($0) && $0.command == s.command }
@@ -242,21 +322,21 @@ private final class Supervisor: @unchecked Sendable {
             guard bytes.count <= 65536 else { throw fail("Input exceeds 64 KiB") }
             try bytes.withUnsafeBytes { b in
                 var sent = 0; while sent < b.count { let n = Darwin.write(child.fd, b.baseAddress!.advanced(by: sent), b.count - sent); if n < 0 && errno == EINTR { continue }; guard n > 0 else { if errno == EAGAIN || errno == EWOULDBLOCK { throw fail("PTY input busy after \(sent) bytes") }; throw sys("input") }; sent += n }
-            }; return Response(services: services)
+            }; return Response()
         case "resize":
             let i = try index(req); guard let child = children[services[i].id], let columns = req.columns, let rows = req.rows, columns > 0, rows > 0 else { throw fail("Running service and valid dimensions required") }
             var ws = winsize(ws_row: rows, ws_col: columns, ws_xpixel: 0, ws_ypixel: 0); guard ioctl(child.fd, TIOCSWINSZ, &ws) == 0 else { throw sys("resize") }; return Response()
         case "event":
             let i = try index(req); guard let bytes = req.data, let message = String(data: bytes, encoding: .utf8), !message.isEmpty, bytes.count <= 256 else { throw fail("UTF-8 event required") }
             event(i, "\(req.actor ?? "User"): \(message)"); try persist(); return Response(services: services)
-        case "shutdown": guard children.isEmpty else { throw fail("Stop running services before shutdown") }; stopped = true; return Response()
+        case "shutdown": guard children.isEmpty else { throw fail("Stop running services before shutdown") }; return Response()
         default: throw fail("Unknown action")
         }
     }
     private func removeService(_ i: Int) throws {
         let removed = services.remove(at: i)
         do { try persist() } catch { services.insert(removed, at: i); throw error }
-        try? FileManager.default.removeItem(at: logURL(removed.id)); logBases.removeValue(forKey: removed.id)
+        try? FileManager.default.removeItem(at: logURL(removed.id)); logBases.removeValue(forKey: removed.id); notifyOutput()
     }
     private func validate(_ s: Service) throws {
         let trimmed = { (v: String) in v.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -293,6 +373,7 @@ private final class Supervisor: @unchecked Sendable {
         appendLog(s.id, Data("\r\n--- Started \(Date()) ---\r\n".utf8))
         children[s.id] = (pid, master); services[i].status = "running"; services[i].pid = pid; services[i].startedAt = Date(); services[i].endedAt = nil; services[i].ports = nil; services[i].exitCode = nil; services[i].startedBy = actor ?? "User"; event(i, "Started by \(services[i].startedBy)")
         let id = s.id
+        collectors[id, default: 0] += 1
         DispatchQueue.global(qos: .utility).async { [self] in collect(id: id, fd: master) }
         DispatchQueue.global(qos: .utility).async { [self] in monitor(id: id, pid: pid) }
         DispatchQueue.global(qos: .utility).async { [self] in collectPorts(id: id, pid: pid) }
@@ -300,7 +381,7 @@ private final class Supervisor: @unchecked Sendable {
     }
     private func collect(id: String, fd: Int32) {
         var buffer = [UInt8](repeating: 0, count: 8192)
-        defer { close(fd) }
+        defer { close(fd); lock.lock(); collectors[id, default: 1] -= 1; if collectors[id] == 0 { collectors.removeValue(forKey: id) }; notifyOutput(); lock.unlock() }
         while true {
             let n = Darwin.read(fd, &buffer, buffer.count)
             if n < 0 && errno == EINTR { continue }
@@ -373,7 +454,7 @@ private final class Supervisor: @unchecked Sendable {
         let signalNumber = status & 0x7f
         services[i].exitCode = signalNumber == 0 ? (status >> 8) & 0xff : 128 + signalNumber
         services[i].status = stopped ? "stopped" : (services[i].exitCode == 0 ? "completed" : "failed")
-        event(i, "Exited with code \(services[i].exitCode!)"); try? persist()
+        event(i, "Exited with code \(services[i].exitCode!)"); try? persist(); notifyOutput()
     }
     private func stop(_ i: Int, actor: String?) throws {
         let id = services[i].id; guard let child = children[id] else { return }

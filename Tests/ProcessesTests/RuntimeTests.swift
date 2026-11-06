@@ -3,6 +3,14 @@ import Foundation
 import Darwin
 import ProcessesProtocol
 
+private final class StreamTestState: @unchecked Sendable {
+    let lock = NSLock()
+    var data = Data()
+    var offset: UInt64 = 0
+    var sawReady = false
+    var error: String?
+}
+
 final class RuntimeTests: XCTestCase {
     func testOlderServiceStateDecodesWithoutNewFields() throws {
         let original = Service(id: "legacy", project: "P", name: "N", command: "echo ok", cwd: "/tmp")
@@ -13,6 +21,52 @@ final class RuntimeTests: XCTestCase {
         XCTAssertNil(restored.automatic)
         XCTAssertNil(restored.ports)
         XCTAssertNil(restored.endedAt)
+    }
+
+    func testOutputStreamOrderingReconnectAndConcurrentControl() throws {
+        guard let executable = ProcessInfo.processInfo.environment["PROCESSES_TEST_EXECUTABLE"] else { throw XCTSkip("Set PROCESSES_TEST_EXECUTABLE to the built CLI") }
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("rs-\(UUID().uuidString.prefix(8))")
+        let daemon = Process(); daemon.executableURL = URL(fileURLWithPath: executable); daemon.arguments = ["daemon", "run"]
+        daemon.environment = ProcessInfo.processInfo.environment.merging(["PROCESSES_HOME": root.path]) { _, new in new }
+        try daemon.run()
+        defer { if daemon.isRunning { daemon.terminate(); daemon.waitUntilExit() }; try? FileManager.default.removeItem(at: root) }
+        let client = RuntimeClient(socketPath: root.appendingPathComponent("control.sock").path)
+        for _ in 0..<100 { if (try? client.send(Request("ping"))) != nil { break }; usleep(50_000) }
+        let service = Service(id: "stream", project: "P", name: "stream", command: "printf READY; sleep 1; head -c 100000 /dev/zero | tr '\\000' X; printf END", cwd: "/tmp")
+        _ = try client.send(Request("run", service: service))
+        let ready = expectation(description: "live bytes"); let ended = expectation(description: "stream ends")
+        let state = StreamTestState()
+        let handle = client.streamOutput(id: service.id) { event in
+            state.lock.lock(); defer { state.lock.unlock() }
+            switch event {
+            case .failure(let error): state.error = error.localizedDescription; ended.fulfill()
+            case .success(let response):
+                let data = response.data ?? Data(); state.data.append(data); state.offset = response.offset ?? state.offset
+                if !state.sawReady && state.data.range(of: Data("READY".utf8)) != nil { state.sawReady = true; ready.fulfill() }
+                if data.isEmpty { ended.fulfill() }
+            }
+        }
+        defer { handle.cancel() }
+        wait(for: [ready], timeout: 3)
+        let before = Date(); _ = try client.send(Request("ping")); XCTAssertLessThan(Date().timeIntervalSince(before), 0.8)
+        wait(for: [ended], timeout: 10)
+        state.lock.lock(); let bytes = state.data; let endOffset = state.offset; let error = state.error; state.lock.unlock()
+        XCTAssertNil(error); XCTAssertTrue(bytes.suffix(3).elementsEqual(Data("END".utf8)))
+        XCTAssertEqual(bytes.filter { $0 == 88 }.count, 100000)
+        guard endOffset >= 70000 else { XCTFail("Insufficient output for reconnect"); return }
+        let reconnect = expectation(description: "reconnect ends"); let replay = StreamTestState()
+        let second = client.streamOutput(id: service.id, offset: endOffset - 70000) { event in
+            replay.lock.lock(); defer { replay.lock.unlock() }
+            switch event {
+            case .failure(let error): replay.error = error.localizedDescription; reconnect.fulfill()
+            case .success(let response): let data = response.data ?? Data(); replay.data.append(data); if data.isEmpty { reconnect.fulfill() }
+            }
+        }
+        defer { second.cancel() }
+        wait(for: [reconnect], timeout: 5)
+        replay.lock.lock(); let replayed = replay.data; let replayFailure = replay.error; replay.lock.unlock()
+        XCTAssertNil(replayFailure); XCTAssertEqual(replayed, bytes.suffix(70000))
+        _ = try client.send(Request("shutdown")); daemon.waitUntilExit()
     }
 
     // Run with PROCESSES_TEST_EXECUTABLE pointing to the built CLI. Unix socket
