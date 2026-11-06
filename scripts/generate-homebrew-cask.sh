@@ -38,7 +38,7 @@ cask "rundock" do
     Connect Codex also installs the bundled routing skill.
   EOS
 
-  zap trash: "~/Library/Application Support/RunDock"
+  # Managed worktrees may contain uncommitted code; retain application data.
 end
 EOF
 echo "Generated $ROOT/Casks/rundock.rb; review the release URL and architecture before publishing the cask."

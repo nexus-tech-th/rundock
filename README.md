@@ -24,7 +24,7 @@ brew update
 brew upgrade --cask nexus-tech-th/rundock/rundock
 ```
 
-Release publication is being prepared; the commands above require a published release and tracked cask. The final release notes identify signing/notarization status.
+Public release apps are Developer ID signed, Apple notarized and stapled. The cask preserves application data and task worktrees when uninstalling.
 
 ## Connect your AI
 
