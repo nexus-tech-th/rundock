@@ -1,0 +1,10 @@
+.build/
+.swiftpm/
+dist/
+.DS_Store
+
+# Local verification contains workstation paths and chat metadata.
+evidence/
+
+__pycache__/
+*.py[cod]

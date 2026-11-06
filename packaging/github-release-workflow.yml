@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag (for example v0.3.1)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUNDOCK_RELEASE_REPOSITORY: nexus-tech-th/rundock
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+      CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Validate release target
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "$RUNDOCK_RELEASE_REPOSITORY" ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "v$(tr -d '\r\n' < VERSION)" == "$RELEASE_TAG" ]]
+          [[ "$(uname -m)" == arm64 ]]
+          [[ "$(git rev-parse HEAD)" == "$(git rev-list -n 1 "$RELEASE_TAG")" ]]
+      - name: Configure optional Developer ID signing and notarization
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$CERTIFICATE_BASE64$CERTIFICATE_PASSWORD$DEVELOPER_ID_APPLICATION$APPLE_ID$APPLE_TEAM_ID$APPLE_APP_PASSWORD" ]]; then
+            echo 'Signing: ad hoc. Notarization: disabled.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          for value in "$CERTIFICATE_BASE64" "$CERTIFICATE_PASSWORD" "$DEVELOPER_ID_APPLICATION" "$APPLE_ID" "$APPLE_TEAM_ID" "$APPLE_APP_PASSWORD"; do
+            [[ -n "$value" ]] || { echo 'All signing and notarization secrets are required when any is configured.' >&2; exit 1; }
+          done
+          KEYCHAIN="$RUNNER_TEMP/rundock-signing.keychain-db"
+          CERTIFICATE="$RUNNER_TEMP/rundock-certificate.p12"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          echo "$CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERTIFICATE" -k "$KEYCHAIN" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          xcrun notarytool store-credentials rundock-notary --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --keychain "$KEYCHAIN"
+          rm -f "$CERTIFICATE"
+          echo "NOTARY_PROFILE=rundock-notary" >> "$GITHUB_ENV"
+          echo "NOTARY_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo 'NOTARIZE=1' >> "$GITHUB_ENV"
+          echo 'Signing: Developer ID. Notarization: enabled; build fails if Apple rejects it.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Build and package
+        run: scripts/package-dmg.sh
+      - name: Test managed runtime and integrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PROCESSES_TEST_EXECUTABLE="$PWD/.build/arm64-apple-macosx/release/processes"
+          swift test --build-system native -c release
+          python3 Tests/session_reuse.py --binary "$PROCESSES_TEST_EXECUTABLE"
+          python3 Tests/ai_connections.py --binary "$PROCESSES_TEST_EXECUTABLE"
+      - name: Verify package and create cask
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          DMG="dist/RunDock-$VERSION-arm64.dmg"
+          (cd dist && shasum -a 256 -c "$(basename "$DMG").sha256")
+          hdiutil verify "$DMG"
+          MOUNT="$(mktemp -d)"
+          trap 'hdiutil detach "$MOUNT" >/dev/null 2>&1 || true; rmdir "$MOUNT" 2>/dev/null || true' EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "$DMG" >/dev/null
+          APP="$MOUNT/RunDock.app"
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" == "$VERSION" ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :RunDockUpdateRepository' "$APP/Contents/Info.plist")" == "$RUNDOCK_RELEASE_REPOSITORY" ]]
+          [[ "$("$APP/Contents/Helpers/rundock" --version)" == "$VERSION" ]]
+          codesign --verify --deep --strict "$APP"
+          SHA="$(awk '{print $1}' "$DMG.sha256")"
+          scripts/generate-homebrew-cask.sh nexus-tech-th rundock "$VERSION" "$SHA"
+      - name: Create draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          # Do not overwrite an existing release or tag: inspect failures before retrying.
+          gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes \
+            "dist/RunDock-$VERSION-arm64.dmg" "dist/RunDock-$VERSION-arm64.dmg.sha256" Casks/rundock.rb
+          echo 'Draft created. Review its artifacts and signing state, publish it, then update Casks/rundock.rb on the default branch using the attached cask.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Clean temporary signing material
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/rundock-certificate.p12"
+          if [[ -f "$RUNNER_TEMP/rundock-signing.keychain-db" ]]; then
+            security delete-keychain "$RUNNER_TEMP/rundock-signing.keychain-db" || true
+          fi
